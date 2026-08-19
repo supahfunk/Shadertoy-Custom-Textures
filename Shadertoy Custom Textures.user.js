@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Shadertoy Custom Textures
-// @namespace    https://supah.it
-// @version      1.2.0
-// @description  Adds a "Custom" tab to the Shadertoy input picker: load any image URL into the clicked iChannel, record it as a comment plus a #define with the texture size and a fitAspect() helper, and restore everything on reload.
-// @author       Fabio Ottaviani
+// @namespace    https://studiogusto.com
+// @version      1.3.0
+// @description  Adds a "Custom" tab to the Shadertoy input picker: load any image URL into the clicked iChannel, record it as a comment plus a #define with the texture size and a fitAspect() helper, restore everything on reload, and keep the custom input out of the save payload so Cloudflare does not block it.
+// @author       Fabio
 // @match        https://www.shadertoy.com/*
 // @match        https://shadertoy.com/*
 // @run-at       document-idle
@@ -281,6 +281,107 @@
         list.unshift(url);
         try { localStorage.setItem(LS_RECENT, JSON.stringify(list.slice(0, 8))); }
         catch (e) { /* ignore */ }
+    }
+
+    // -------------------------------------------------------------- save guard
+
+    // Saving with a custom texture bound makes Shadertoy POST an input whose
+    // "filepath" is an absolute external URL:
+    //
+    //   "inputs":[{"channel":0,"type":"texture","id":1,
+    //              "filepath":"https://example.com/tex.png", ...}]
+    //
+    // Cloudflare answers that POST with an interactive challenge page instead of
+    // letting it through, so the save fails. The same URL inside the shader code
+    // (our comment) goes through fine — it is that field that trips the WAF.
+    //
+    // We strip those inputs from the outgoing payload only. The page keeps the
+    // texture bound, and reopening the shader restores it from the comment.
+
+    function isExternalInput(input) {
+        return input
+            && typeof input.filepath === 'string'
+            && /^https?:\/\//i.test(input.filepath)
+            && !/^https?:\/\/([a-z0-9-]+\.)*shadertoy\.com\//i.test(input.filepath);
+    }
+
+    // Returns the rewritten JSON string, or null when nothing had to change.
+    function stripExternalInputs(json) {
+        let data;
+        try { data = JSON.parse(json); } catch (e) { return null; }
+        if (!data || !Array.isArray(data.renderpass)) return null;
+
+        let removed = 0;
+        data.renderpass.forEach(function (pass) {
+            if (!Array.isArray(pass.inputs)) return;
+            const kept = pass.inputs.filter(function (i) { return !isExternalInput(i); });
+            removed += pass.inputs.length - kept.length;
+            pass.inputs = kept;
+        });
+        if (!removed) return null;
+
+        console.log('[Custom Textures] removed ' + removed +
+                    ' custom input(s) from the save payload (Cloudflare blocks external filepaths).');
+        return JSON.stringify(data);
+    }
+
+    // Shadertoy posts the shader as the "u" field. Handles FormData,
+    // URLSearchParams and raw urlencoded strings.
+    function scrubBody(body) {
+        if (body instanceof FormData || body instanceof URLSearchParams) {
+            const u = body.get('u');
+            if (typeof u === 'string') {
+                const next = stripExternalInputs(u);
+                if (next) body.set('u', next);
+            }
+            return body;
+        }
+        if (typeof body === 'string' && body.indexOf('u=') !== -1) {
+            const params = new URLSearchParams(body);
+            const u = params.get('u');
+            if (typeof u === 'string') {
+                const next = stripExternalInputs(u);
+                if (next) {
+                    params.set('u', next);
+                    return params.toString();
+                }
+            }
+        }
+        return body;
+    }
+
+    function isSaveUrl(url) {
+        return typeof url === 'string' && /(^|\/)shadertoy(\?|$)/.test(url.split('#')[0]);
+    }
+
+    function patchSave() {
+        const openOrig = XMLHttpRequest.prototype.open;
+        const sendOrig = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function (method, url) {
+            this.__stcUrl = url;
+            return openOrig.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function (body) {
+            if (isSaveUrl(this.__stcUrl)) {
+                try { body = scrubBody(body); }
+                catch (e) { console.warn('[Custom Textures] could not scrub the save payload:', e); }
+            }
+            return sendOrig.call(this, body);
+        };
+
+        const fetchOrig = window.fetch;
+        if (typeof fetchOrig === 'function') {
+            window.fetch = function (input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url);
+                if (isSaveUrl(url) && init && init.body) {
+                    try { init = Object.assign({}, init, { body: scrubBody(init.body) }); }
+                    catch (e) { console.warn('[Custom Textures] could not scrub the save payload:', e); }
+                }
+                return fetchOrig.call(this, input, init);
+            };
+        }
     }
 
     // --------------------------------------------------------------- dialog ui
@@ -594,6 +695,7 @@
     }
 
     injectStyles();
+    patchSave();
     whenReady(function () {
         watchDialogs();
         restoreFromHeader();
